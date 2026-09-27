@@ -1,0 +1,491 @@
+/**
+ * pi-session-archive: archive sessions by moving them out of the active tree.
+ *
+ * What it does, and why pi-web needs no change:
+ *   pi scans `<agentDir>/sessions/<project>/*.jsonl`. The archive root is a flat
+ *   *sibling* of that directory, so an archived file stops appearing in
+ *   `/resume` and in pi-web's sidebar simply by not being there. pi-web already
+ *   loads and binds extensions and bridges their UI, so the commands and the
+ *   archive commands work in both hosts.
+ *
+ * Ownership, matching pi's own rule for deleting a session: you may not archive
+ * the session this runtime is using, and nothing else is checked. pi does not
+ * look at whether another process has a session open either, so neither do we -
+ * two runtimes on one session both carry on typing, as they would without us.
+ *
+ * Where each entry point actually works, as host facts rather than wishes:
+ *   - `/archive` and Ctrl+Shift+A list the sessions and archive the one you
+ *     pick. The shortcut fires from the prompt editor, which is the only place
+ *     pi routes extension keys to (`defaultEditor.onExtensionShortcut`); it does
+ *     not fire inside the
+ *     built-in `/resume` list, which exposes no extension hook, and pi-web does
+ *     not wire the channel at all. In a browser, use the command.
+ *   - `/archived` lists archived roots in a human-readable picker. Subagent
+ *     children are folded into their root, while a stable trailing #id keeps the
+ *     selection unambiguous.
+ *   - Archiving a root archives its subagent descendants; a child is never an
+ *     operation root of its own, in either direction.
+ *
+ * Honest limits:
+ *   - The session this runtime is currently using is never archived.
+ *   - Cascades contain the durable child sessions that exist at the decisive
+ *     lock-time scan. The extension does not infer hypothetical future files.
+ *   - `/archive-check` reports damaged/split state but diagnostics do not become
+ *     a global write gate for unrelated sessions.
+ */
+
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { Key } from "@earendil-works/pi-tui";
+import { homedir } from "node:os";
+import { basename, dirname } from "node:path";
+import { resolveArchivedTarget } from "./archive-flow.ts";
+import { describeReachability, exportArchivedSessionHtml } from "./export-html.ts";
+import { describeActiveRow, idFromLabel, listActiveRoots, rowTitle, uniqueIdPrefixes } from "./active-list.ts";
+import { archiveManyInOneGo, selectPaged } from "./picker.ts";
+import { findSessionPathByIdHint } from "./locate-session.ts";
+import {
+  archiveSessionTree,
+  listArchivedSessions,
+  restoreSessionTree,
+  type ArchivedSessionRow,
+  type MigrationDeps,
+  type OperationResult,
+} from "./migrate.ts";
+import { reconcileArchive } from "./reconcile.ts";
+import { pathKey, sessionRootsFrom } from "./paths.ts";
+import { classifySessionFile, scanSessionRoots } from "./scanner.ts";
+import { describeSession } from "./session-summary.ts";
+
+/** Modes with a usable UI; print and json have no dialogs at all. */
+const INTERACTIVE_MODES = new Set(["tui", "rpc"]);
+
+/** Command handlers get a richer context than lifecycle handlers. */
+type CommandContext = ExtensionContext & {
+  waitForIdle: () => Promise<void>;
+  newSession?: (options?: {
+    parentSession?: string;
+    withSession?: (fresh: unknown) => Promise<void>;
+  }) => Promise<{ cancelled: boolean }>;
+  switchSession?: (sessionPath: string) => Promise<{ cancelled: boolean }>;
+};
+
+export default function sessionArchiveExtension(pi: ExtensionAPI): void {
+
+  const agentDir = (): string | undefined => {
+    try {
+      return getAgentDir();
+    } catch {
+      return undefined; // A host without an agent dir gets no archive at all.
+    }
+  };
+
+  const homeDir = (): string => {
+    try {
+      return homedir();
+    } catch {
+      return "";
+    }
+  };
+
+  const notify = (ctx: ExtensionContext, message: string, level: "info" | "warning" | "error" = "info") => {
+    ctx.ui.notify?.(message, level);
+  };
+
+  const report = (ctx: ExtensionContext, result: OperationResult, successVerb: "Archived" | "Restored") => {
+    if (result.ok) {
+      notify(ctx, `${successVerb} ${result.affected.length} session(s).`, "info");
+      for (const warning of result.warnings ?? []) notify(ctx, warning, "warning");
+      return;
+    }
+    notify(ctx, result.message, "warning");
+    for (const id of result.blockers ?? []) notify(ctx, `  blocked: ${id}`, "warning");
+    // A failed rollback leaves the tree in a state we could not undo; the
+    // operator needs to know where every file actually is.
+    for (const [id, path] of Object.entries(result.actualPaths ?? {})) {
+      notify(ctx, `  ${id}: ${path}`, "warning");
+    }
+  };
+
+  /** The cwds of live sessions, which is what pi-web's file tree is built from. */
+  const activeCwds = (ctx: ExtensionContext): string[] => {
+    const dir = agentDir();
+    if (!dir) return [];
+    try {
+      return scanSessionRoots(sessionRootsFrom(ctx, dir)).sessions
+        .map((session) => session.cwd)
+        .filter((cwd): cwd is string => typeof cwd === "string");
+    } catch {
+      return [];
+    }
+  };
+
+  /** Switch to a live session. Returns false when the host cannot. */
+  const switchToSession = async (
+    ctx: ExtensionContext,
+    sessionId: string,
+    preferredPath?: string,
+  ): Promise<boolean> => {
+    const command = ctx as CommandContext;
+    const dir = agentDir();
+    if (typeof command.switchSession !== "function" || !dir) return false;
+
+    // A v2 archive index remembers the exact source path. That is authoritative
+    // for custom --session-dir layouts that are outside the default sessions
+    // tree and therefore cannot be rediscovered by filename scanning. Still
+    // verify the header before handing the path to the host.
+    let path: string | undefined;
+    if (preferredPath) {
+      const { info } = classifySessionFile(preferredPath);
+      if (info?.id === sessionId) path = preferredPath;
+    }
+    path ??= findSessionPathByIdHint(sessionId, dir);
+    if (!path) return false;
+    try {
+      return !(await command.switchSession(path)).cancelled;
+    } catch {
+      return false;
+    }
+  };
+
+  /**
+   * The file this runtime is running, if it has one on disk.
+   *
+   * This is the only ownership fact the extension needs, and it is compared by
+   * path: the path is what actually gets moved, it behaves the same under a
+   * custom session dir, and it does not depend on how two sessions are named.
+   * It matches pi's own rule - you may not delete the session you are sitting
+   * in, and nothing stops you from deleting any other one, even if some other
+   * process has it open.
+   */
+  const hostActiveFile = (ctx: ExtensionContext): string | undefined => {
+    const file = (ctx.sessionManager as { getSessionFile?: () => string | undefined }).getSessionFile?.();
+    return file && file.length > 0 ? file : undefined;
+  };
+
+  const isHostActiveFile = (ctx: ExtensionContext) => (sessionPath: string): boolean => {
+    const active = hostActiveFile(ctx);
+    return active !== undefined && pathKey(active) === pathKey(sessionPath);
+  };
+
+
+  /**
+   * Run an operation and turn anything thrown into a reported failure.
+   *
+   * The operations return failures rather than raising, but the filesystem still
+   * gets a vote - a permission error, a path that is a file where a directory
+   * should be. An exception escaping a command handler does not just fail that
+   * command: it abandons the picker loop the person is standing in, with nothing
+   * said. So the boundary catches, and the refusal is reported like any other.
+   */
+  const run = async <T>(ctx: ExtensionContext, what: string, operation: () => Promise<T>): Promise<T | undefined> => {
+    try {
+      return await operation();
+    } catch (error) {
+      notify(ctx, `${what} failed: ${String(error)}`, "error");
+      return undefined;
+    }
+  };
+
+  const migrationDeps = (ctx: ExtensionContext): MigrationDeps => ({
+    agentDir: agentDir(),
+    sessionRoots: sessionRootsFrom(ctx, agentDir() ?? ""),
+    isHostActiveFile: isHostActiveFile(ctx),
+  });
+
+  /**
+   * Archive a session the user picks.
+   *
+   * Archiving is a list action. Picking a session that is not the one running
+   * this command needs no session switch at all, which is why it works in a
+   * browser too; picking "the session I am in" is simply refused.
+   */
+  /** Archive one picked row, or return false when the user backed out. */
+  const archivePickedRow = async (ctx: ExtensionContext, label: string): Promise<boolean> => {
+    // Resolve by the id embedded in the label, never by matching the whole
+    // label: the relative time in it moves while the user is looking at it.
+    const shortId = idFromLabel(label);
+    const listed = await run(ctx, "Refresh session list", () =>
+      listActiveRoots({ agentDir: agentDir(), sessionRoots: sessionRootsFrom(ctx, agentDir() ?? "") }),
+    );
+    if (!listed) return false;
+    const exact = shortId ? listed.rows.filter((row) => row.session.id === shortId) : [];
+    const candidates = exact.length > 0
+      ? exact
+      : shortId
+        ? listed.rows.filter((row) => row.session.id.startsWith(shortId))
+        : [];
+    if (candidates.length !== 1) {
+      notify(
+        ctx,
+        candidates.length === 0
+          ? "That session is no longer in the list."
+          : "That short session id is no longer unique. Run /archive again.",
+        "warning",
+      );
+      return false;
+    }
+    const picked = candidates[0]!;
+
+    // The one rule: you cannot archive the session this runtime is using. We
+    // compare paths, because that is the file that would be moved. Everything
+    // else goes through, including a session some other pi has open - that is
+    // pi's own behaviour for delete, and being stricter here only breaks
+    // legitimate use.
+    if (isHostActiveFile(ctx)(picked.session.path)) {
+      notify(ctx, "Cannot archive the currently active session. Switch to another session first.", "warning");
+      return false;
+    }
+
+    const result = await run(ctx, "Archive", () => archiveSessionTree(picked.session.id, migrationDeps(ctx)));
+    if (!result) return false;
+    if (!result.ok) report(ctx, result, "Archived");
+    else for (const warning of result.warnings ?? []) notify(ctx, warning, "warning");
+    return result.ok;
+  };
+
+  /**
+   * The archive command: a paged list, and a loop, because archiving one session
+   * and then having to type the command again for the next one is what makes
+   * tidying up annoying.
+   */
+  const archivePickedSession = async (ctx: ExtensionContext, filter?: string): Promise<void> => {
+    if (!INTERACTIVE_MODES.has(ctx.mode)) {
+      notify(ctx, "Archiving needs a terminal or web session.", "warning");
+      return;
+    }
+    const needle = (filter ?? "").trim().toLowerCase();
+    let warnedScanIssues = false;
+
+    const outcome = await run(ctx, "Archive picker", () => archiveManyInOneGo(ctx, {
+      title: "Archive a session",
+      pageSize: 20,
+      titleSuffix: needle ? `matching "${filter}"` : undefined,
+      emptyLabel: "No sessions to archive.",
+      rows: async () => {
+        const nowMs = Date.now();
+        const { rows, problems } = await listActiveRoots({ agentDir: agentDir(), sessionRoots: sessionRootsFrom(ctx, agentDir() ?? "") });
+        if (problems.length > 0 && !warnedScanIssues) {
+          warnedScanIssues = true;
+          notify(ctx, `Session scan found ${problems.length} issue(s); /archive-check has details.`, "warning");
+        }
+        const matching = rows.filter(
+          (row) =>
+            needle === "" ||
+            `${rowTitle(row)} ${row.session.cwd ?? ""} ${row.session.id}`.toLowerCase().includes(needle),
+        );
+        const idTokens = uniqueIdPrefixes(matching.map((row) => row.session.id));
+        return {
+          rows: matching.map((row) =>
+            describeActiveRow(row, nowMs, idTokens.get(row.session.id), isHostActiveFile(ctx)(row.session.path)),
+          ),
+        };
+      },
+      archive: (label) => archivePickedRow(ctx, label),
+      describe: (label) => `Archived: ${label}`,
+    }));
+    if (!outcome) return;
+
+    void outcome;
+  };
+
+  /**
+   * Export a session and say something the user can act on: a name they can
+   * recognise, and where to click. A bare `/tmp/<uuid>.html` was not usable.
+   */
+  const exportSession = (ctx: ExtensionContext, row: ArchivedSessionRow, explicitDir?: string): void => {
+    const exported = exportArchivedSessionHtml(row.session.path, {
+      outDir: explicitDir,
+      label: row.session.name?.trim() || row.session.firstMessage?.trim() || row.session.id,
+      archivedAt: row.archivedAt,
+    });
+    if (!exported.ok) {
+      notify(ctx, exported.message, "error");
+      return;
+    }
+    const dir = dirname(exported.outputPath);
+    const reachability = describeReachability(dir, activeCwds(ctx), homeDir());
+    notify(ctx, `Exported ${basename(exported.outputPath)} to ${dir}`, "info");
+    notify(ctx, reachability.message, reachability.browsable ? "info" : "warning");
+  };
+
+  /**
+   * A key to archive the session you are in.
+   *
+   * pi routes extension shortcuts to the prompt editor, which is why this fires
+   * while typing and not inside the built-in `/resume` list (that list has no
+   * extension hook at all). pi-web does not wire the channel, so in a browser the
+   * command palette entry is the route.
+   */
+  pi.registerShortcut(Key.ctrlShift("a"), {
+    description: "Pick a session to archive (with its subagent sessions)",
+    handler: async (ctx) => archivePickedSession(ctx),
+  });
+
+  pi.registerCommand("archive", {
+    description: "Pick a session to archive, with its subagent sessions (usage: /archive [filter])",
+    handler: async (args, ctx) => archivePickedSession(ctx, args),
+  });
+
+  pi.registerCommand("archived", {
+    description: "List archived sessions and restore or export one",
+    handler: async (args, ctx) => {
+      if (!INTERACTIVE_MODES.has(ctx.mode)) {
+        notify(ctx, "The archive list needs a terminal or web session.", "warning");
+        return;
+      }
+      const needle = args.trim().toLowerCase();
+      const listed = await run(ctx, "List archived sessions", () =>
+        listArchivedSessions({ agentDir: agentDir(), sessionRoots: sessionRootsFrom(ctx, agentDir() ?? "") }),
+      );
+      if (!listed) return;
+      const { rows, problems } = listed;
+      if (problems.length > 0) notify(ctx, `${problems.length} archive diagnostic issue(s); /archive-check has details.`, "warning");
+
+      const matching = rows.filter(
+        (row) =>
+          needle === "" ||
+          `${row.session.name ?? ""} ${row.session.firstMessage ?? ""} ${row.cwd ?? row.session.cwd ?? ""} ${row.session.id}`
+            .toLowerCase()
+            .includes(needle),
+      );
+      if (matching.length === 0) {
+        notify(
+          ctx,
+          rows.length === 0 ? "Nothing archived yet." : `No archived session matches "${args.trim()}".`,
+          "warning",
+        );
+        return;
+      }
+
+      // Paged, and the label maps back to the row exactly.
+      const idTokens = uniqueIdPrefixes(matching.map((row) => row.session.id));
+      const entries = matching.map((row) => ({
+        row,
+        label: describeSession(row, idTokens.get(row.session.id)),
+      }));
+      // A corrupt archive can contain two files with the same session id. Their
+      // human labels may then still be identical even after id-prefix expansion.
+      // Keep the picker selection path-safe: only the colliding rows gain a
+      // filename suffix, so export can never silently choose the first file.
+      const labelCounts = new Map<string, number>();
+      for (const entry of entries) labelCounts.set(entry.label, (labelCounts.get(entry.label) ?? 0) + 1);
+      for (const entry of entries) {
+        if ((labelCounts.get(entry.label) ?? 0) > 1) {
+          entry.label = `${entry.label} · file ${basename(entry.row.session.path)}`;
+        }
+      }
+      const picked = await selectPaged(ctx, "Archived sessions", entries.map((entry) => entry.label), {
+        pageSize: 20,
+        titleSuffix: needle ? `matching "${args.trim()}"` : undefined,
+        emptyLabel: "Nothing archived.",
+      });
+      if (!picked.value) return;
+      const chosen = entries.find((entry) => entry.label === picked.value);
+      if (!chosen) {
+        notify(ctx, "That archived session is no longer in the list.", "warning");
+        return;
+      }
+
+      const action = await ctx.ui.select(chosen.label, [
+        "Restore and open it here",
+        "Restore it (stay where you are)",
+        "Export to HTML - read it without restoring",
+      ]);
+      if (!action) return;
+
+      if (action.startsWith("Export")) {
+        exportSession(ctx, chosen.row);
+        return;
+      }
+
+      const result = await run(ctx, "Restore", () => restoreSessionTree(chosen.row.session.id, migrationDeps(ctx)));
+      if (!result) return;
+      report(ctx, result, "Restored");
+      if (!result.ok || !action.startsWith("Restore and open")) return;
+      // Opening it right here is the point of "restore": otherwise it is a session
+      // nobody can find. pi-web cancels every switch, so this degrades to a hint
+      // rather than an error.
+      if (!(await switchToSession(ctx, chosen.row.session.id, chosen.row.originalPath))) {
+        notify(ctx, "Restored. It is back in the session list; open it from /resume.", "info");
+      }
+    },
+  });
+
+  /**
+   * What the archive looks like right now: what is in it, and - the part that
+   * matters - whether any subagent session is still active while its parent is
+   * archived, or whether one session exists in both places.
+   */
+  pi.registerCommand("archive-check", {
+    description: "Check the archive for splits: subagent sessions left behind, or a session in two places",
+    handler: async (_args, ctx) => {
+      const checked = await run(ctx, "Archive check", () =>
+        reconcileArchive({ agentDir: agentDir(), sessionRoots: sessionRootsFrom(ctx, agentDir() ?? "") }),
+      );
+      if (!checked) return;
+      const report = checked;
+      if (report.diagnostics.length === 0) {
+        notify(ctx, `Archive looks consistent: ${report.archived.length} archived session(s), no splits.`, "info");
+        return;
+      }
+      for (const diagnostic of report.diagnostics) {
+        notify(ctx, `${diagnostic.kind}: ${diagnostic.message}`, diagnostic.kind === "stray-file" ? "warning" : "error");
+      }
+      notify(ctx, `${report.diagnostics.length} thing(s) to look at. Split children are shown as recovery roots in /archive or /archived.`, "warning");
+    },
+  });
+
+  pi.registerCommand("unarchive", {
+    description: "Restore an archived session by id (usage: /unarchive <id>)",
+    handler: async (args, ctx) => {
+      if (!INTERACTIVE_MODES.has(ctx.mode)) {
+        notify(ctx, "Restoring needs a terminal or web session.", "warning");
+        return;
+      }
+      const listed = await run(ctx, "List archived sessions", () =>
+        listArchivedSessions({ agentDir: agentDir(), sessionRoots: sessionRootsFrom(ctx, agentDir() ?? "") }),
+      );
+      if (!listed) return;
+      const resolved = resolveArchivedTarget(listed.rows, args);
+      if (!resolved.ok || !resolved.row) {
+        notify(ctx, resolved.message ?? "Nothing to restore.", "warning");
+        return;
+      }
+      const target = resolved.row.session.id;
+      const restored = await run(ctx, "Restore", () => restoreSessionTree(target, migrationDeps(ctx)));
+      if (restored) report(ctx, restored, "Restored");
+    },
+  });
+
+  pi.registerCommand("archived-export", {
+    description: "Export a session to HTML without restoring it (usage: /archived-export <id-or-text> [--in <directory>])",
+    handler: async (args, ctx) => {
+      // `--in <dir>` names the output directory explicitly, so a multi-word target is
+      // never mistaken for one; everything else is the target, spaces included.
+      // A directory is named explicitly, because a multi-word target and
+      // "target plus directory" are otherwise indistinguishable.
+      const trimmed = args.trim();
+      // The output directory is a trailing option so the target may itself
+      // contain spaces: `/archived-export fix the auth --in /tmp/reports`.
+      const dirMatch = /^(.*?)\s+--in\s+(.+?)\s*$/.exec(trimmed);
+      const target = (dirMatch?.[1] ?? trimmed).replace(/\s+/g, " ").trim();
+      const explicitDir = dirMatch?.[2]?.trim();
+      const listed = await run(ctx, "List archived sessions", () =>
+        listArchivedSessions({ agentDir: agentDir(), sessionRoots: sessionRootsFrom(ctx, agentDir() ?? "") }),
+      );
+      if (!listed) return;
+      const { rows } = listed;
+      if (rows.length === 0) {
+        notify(ctx, "Nothing archived yet.", "warning");
+        return;
+      }
+      const resolved = resolveArchivedTarget(rows, target ?? "");
+      if (!resolved.ok || !resolved.row) {
+        notify(ctx, resolved.message ?? "Nothing to export.", "warning");
+        return;
+      }
+      exportSession(ctx, resolved.row, explicitDir);
+    },
+  });
+}
