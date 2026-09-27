@@ -1,12 +1,16 @@
 /**
- * Picking more than one thing, and more rows than a picker shows.
+ * Session pickers shared by archive/restore flows.
  *
- * `ui.select` takes a flat list of strings and returns one choice, so both
- * problems - "there are 500 sessions and I can only see the first screen", and
- * "archiving one closes the dialog, so I have to type the command again" - are
- * solved the same way: drive the picker in a loop from here, so the interaction
- * stays on screen instead of returning to the prompt after every choice.
+ * Pi's normal `ui.select` is intentionally single-choice. In RPC mode (Pi Web)
+ * that is the only interactive list primitive available, so multi-select is
+ * implemented as a small "selection basket": choosing a row toggles it, and
+ * nothing is mutated until the explicit "Archive selected" action is chosen.
+ *
+ * In TUI mode we can use `ui.custom`, so the same model becomes a true
+ * single-screen multi-select: arrows move, Space toggles, Enter commits.
  */
+
+import { Key, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 
 export interface PagedSelectOptions {
   /** Rows per page. */
@@ -76,65 +80,239 @@ export async function selectPaged(
   }
 }
 
-export interface LoopChoice {
-  action: "again" | "done" | "quit";
-  /** The row the user picked this round, if any. */
-  value?: string;
-  page?: number;
+export interface MultiSelectItem {
+  /** Stable identity returned to the caller. */
+  value: string;
+  /** Human-readable session row. */
+  label: string;
+  /** Disabled rows remain visible for context but cannot be selected. */
+  disabled?: boolean;
+  disabledReason?: string;
+}
+
+export interface MultiSelectOptions {
+  pageSize?: number;
+  titleSuffix?: string;
+  emptyLabel?: string;
+  commitVerb?: string;
+}
+
+type MultiSelectContext = {
+  mode?: string;
+  ui: {
+    select(title: string, options: string[], opts?: unknown): Promise<string | undefined>;
+    notify?(message: string, type?: "info" | "warning" | "error"): void;
+    custom?<T>(
+      factory: (
+        tui: { requestRender(): void },
+        theme: {
+          fg(kind: string, text: string): string;
+          bold(text: string): string;
+        },
+        keybindings: unknown,
+        done: (value: T) => void,
+      ) => unknown,
+      opts?: unknown,
+    ): Promise<T | undefined>;
+  };
+};
+
+function heading(title: string, suffix: string | undefined): string {
+  return suffix ? `${title} — ${suffix}` : title;
+}
+
+function selectedValues(items: readonly MultiSelectItem[], selected: ReadonlySet<string>): string[] {
+  return items.filter((item) => selected.has(item.value)).map((item) => item.value);
 }
 
 /**
- * Keep listing and archiving until the user is finished, so one `/archive` can
- * tidy a dozen sessions instead of a dozen invocations.
+ * RPC fallback for Pi Web.
+ *
+ * The protocol only supports one returned value per `select`, so each click
+ * toggles a stable basket entry and redraws the same list. No archive happens
+ * during selection; one explicit commit action applies the whole batch.
  */
-export async function archiveManyInOneGo(
-  ctx: {
-    ui: {
-      select(title: string, options: string[], opts?: unknown): Promise<string | undefined>;
-      notify(message: string, type?: "info" | "warning" | "error"): void;
-    };
-  },
-  options: {
-    title: string;
-    /** Rows currently available; called again after each archive. */
-    rows: () => Promise<{ rows: string[] }>;
-    /** Do the work for the picked row. Return whether it happened. */
-    archive: (label: string) => Promise<boolean>;
-    /** Summarise one archived row. */
-    describe: (label: string) => string;
-    pageSize?: number;
-    titleSuffix?: string;
-    emptyLabel?: string;
-  },
-): Promise<{ archived: number }> {
-  let archived = 0;
-  for (let round = 0; round < 200; round += 1) {
-    // Re-read every round: the list shrinks as sessions leave the active root.
-    const { rows } = await options.rows();
-    if (rows.length === 0) {
-      ctx.ui.notify(options.emptyLabel ?? "Nothing left to archive.");
-      return { archived };
-    }
+async function selectManyRpc(
+  ctx: MultiSelectContext,
+  title: string,
+  items: readonly MultiSelectItem[],
+  options: MultiSelectOptions,
+): Promise<string[]> {
+  const pageSize = Math.max(1, options.pageSize ?? 20);
+  const pages = Math.max(1, Math.ceil(items.length / pageSize));
+  const selected = new Set<string>();
+  const commitVerb = options.commitVerb ?? "Archive";
+  let page = 1;
 
-    const picked = await selectPaged(ctx, options.title, rows, {
-      pageSize: options.pageSize,
-      titleSuffix: options.titleSuffix,
+  for (;;) {
+    const slice = items.slice((page - 1) * pageSize, page * pageSize);
+    const rendered = slice.map((item) => {
+      const state = item.disabled ? "[-]" : selected.has(item.value) ? "[x]" : "[ ]";
+      const reason = item.disabled && item.disabledReason ? ` · ${item.disabledReason}` : "";
+      return `${state} ${item.label}${reason}`;
     });
-    if (!picked.value) return { archived };
 
-    const done = await options.archive(picked.value);
-    if (done) {
-      archived += 1;
-      ctx.ui.notify(options.describe(picked.value));
+    const controls: string[] = [];
+    if (selected.size > 0) controls.push(`✓ ${commitVerb} selected (${selected.size})`);
+    if (page > 1) controls.push(`${PREVIOUS} previous page`);
+    if (page < pages) controls.push(`${NEXT} next page (${pages} pages)`);
+    controls.push("Cancel");
+
+    const titleText = `${heading(title, options.titleSuffix)} · page ${page}/${pages} · ${selected.size} selected`;
+    const picked = await ctx.ui.select(titleText, [...rendered, ...controls]);
+    if (!picked || picked === "Cancel") return [];
+
+    if (picked === `${PREVIOUS} previous page`) {
+      page = Math.max(1, page - 1);
+      continue;
+    }
+    if (picked === `${NEXT} next page (${pages} pages)`) {
+      page = Math.min(pages, page + 1);
+      continue;
+    }
+    if (picked === `✓ ${commitVerb} selected (${selected.size})`) {
+      return selectedValues(items, selected);
     }
 
-    // Staying in the loop is the whole point: no command to retype.
-    const next = await ctx.ui.select("Archive more?", [
-      `Yes - archive another (${archived} done so far)`,
-      "No - I'm done",
-    ]);
-    if (!next?.startsWith("Yes")) return { archived };
+    const index = rendered.indexOf(picked);
+    if (index < 0) continue;
+    const item = slice[index]!;
+    if (item.disabled) {
+      ctx.ui.notify?.(item.disabledReason ?? "That session cannot be selected.", "warning");
+      continue;
+    }
+    if (selected.has(item.value)) selected.delete(item.value);
+    else selected.add(item.value);
   }
-  ctx.ui.notify("Stopped after 200 sessions in one go.");
-  return { archived };
+}
+
+/**
+ * Native TUI multi-select. This is one component from open to commit, so the
+ * user never bounces through a series of dialogs.
+ */
+async function selectManyTui(
+  ctx: MultiSelectContext,
+  title: string,
+  items: readonly MultiSelectItem[],
+  options: MultiSelectOptions,
+): Promise<string[]> {
+  if (typeof ctx.ui.custom !== "function") return selectManyRpc(ctx, title, items, options);
+
+  const pageSize = Math.max(1, options.pageSize ?? 20);
+  const commitVerb = options.commitVerb ?? "Archive";
+  const result = await ctx.ui.custom<string[] | null>((tui, theme, _keybindings, done) => {
+    let cursor = 0;
+    let scroll = 0;
+    const selected = new Set<string>();
+
+    const moveToSelectable = (direction: 1 | -1): void => {
+      if (items.length === 0) return;
+      let next = cursor;
+      for (let tries = 0; tries < items.length; tries += 1) {
+        next = Math.max(0, Math.min(items.length - 1, next + direction));
+        cursor = next;
+        if (!items[cursor]?.disabled) break;
+        if (next === 0 || next === items.length - 1) break;
+      }
+      if (cursor < scroll) scroll = cursor;
+      if (cursor >= scroll + pageSize) scroll = cursor - pageSize + 1;
+    };
+
+    const toggleCurrent = (): void => {
+      const item = items[cursor];
+      if (!item || item.disabled) return;
+      if (selected.has(item.value)) selected.delete(item.value);
+      else selected.add(item.value);
+    };
+
+    const render = (width: number): string[] => {
+      const w = Math.max(1, width);
+      const lines: string[] = [];
+      const titleText = heading(title, options.titleSuffix);
+      lines.push(truncateToWidth(theme.fg("accent", theme.bold(titleText)), w));
+      lines.push(truncateToWidth(theme.fg("dim", `${selected.size} selected`), w));
+
+      const end = Math.min(items.length, scroll + pageSize);
+      for (let index = scroll; index < end; index += 1) {
+        const item = items[index]!;
+        const pointer = index === cursor ? theme.fg("accent", "›") : " ";
+        const state = item.disabled ? "[-]" : selected.has(item.value) ? "[x]" : "[ ]";
+        const reason = item.disabled && item.disabledReason ? ` · ${item.disabledReason}` : "";
+        const row = `${pointer} ${state} ${item.label}${reason}`;
+        lines.push(truncateToWidth(index === cursor ? theme.fg("accent", row) : row, w));
+      }
+
+      if (items.length > pageSize) {
+        lines.push(truncateToWidth(theme.fg("dim", `rows ${scroll + 1}-${end} of ${items.length}`), w));
+      }
+      lines.push(
+        truncateToWidth(
+          theme.fg("dim", `↑↓ move · Space toggle · A all/none · Enter ${commitVerb.toLowerCase()} selected · Esc cancel`),
+          w,
+        ),
+      );
+      return lines;
+    };
+
+    const handleInput = (data: string): void => {
+      if (matchesKey(data, Key.up)) {
+        moveToSelectable(-1);
+        tui.requestRender();
+        return;
+      }
+      if (matchesKey(data, Key.down)) {
+        moveToSelectable(1);
+        tui.requestRender();
+        return;
+      }
+      if (matchesKey(data, Key.space)) {
+        toggleCurrent();
+        tui.requestRender();
+        return;
+      }
+      if (data.toLowerCase() === "a") {
+        const enabled = items.filter((item) => !item.disabled);
+        const allSelected = enabled.length > 0 && enabled.every((item) => selected.has(item.value));
+        selected.clear();
+        if (!allSelected) for (const item of enabled) selected.add(item.value);
+        tui.requestRender();
+        return;
+      }
+      if (matchesKey(data, Key.enter)) {
+        if (selected.size > 0) done(selectedValues(items, selected));
+        return;
+      }
+      if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
+        done(null);
+      }
+    };
+
+    return {
+      render,
+      invalidate() {},
+      handleInput,
+    };
+  });
+
+  return result ?? [];
+}
+
+/**
+ * Pick zero or more session rows and return their stable ids.
+ *
+ * TUI gets a true single-screen multi-select. RPC/Pi Web gets the same selection
+ * model over its single-value protocol, with no mutation until final commit.
+ */
+export async function selectMany(
+  ctx: MultiSelectContext,
+  title: string,
+  items: readonly MultiSelectItem[],
+  options: MultiSelectOptions = {},
+): Promise<string[]> {
+  if (items.length === 0) {
+    ctx.ui.notify?.(options.emptyLabel ?? "Nothing to choose.", "info");
+    return [];
+  }
+  if (ctx.mode === "tui") return selectManyTui(ctx, title, items, options);
+  return selectManyRpc(ctx, title, items, options);
 }
