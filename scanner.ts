@@ -8,7 +8,7 @@
  * classify them ourselves.
  */
 
-import { closeSync, openSync, readSync, readdirSync, statSync } from "node:fs";
+import { closeSync, fstatSync, openSync, readSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { sessionIdFromFileName } from "./paths.ts";
 
@@ -70,19 +70,143 @@ const RELATION_LINE_MAX_BYTES = 8 * 1024 * 1024;
 const HEADER_LINE_MAX_BYTES = 1024 * 1024;
 
 
-/** Latest session name found in the bounded head, for a list label. */
-function sessionNameFromHead(head: string): string | undefined {
-  let name: string | undefined;
-  for (const line of head.split("\n").slice(1)) {
-    if (!line.includes('"type":"session_info"')) continue;
-    try {
-      const entry = JSON.parse(line) as { type?: string; name?: unknown };
-      if (entry.type === "session_info" && typeof entry.name === "string" && entry.name.trim()) name = entry.name.trim();
-    } catch {
-      // A malformed line is not a usable name.
+interface DisplayMetadata {
+  name?: string;
+  activityMs?: number;
+}
+
+interface DisplayMetadataCacheEntry extends DisplayMetadata {
+  size: number;
+  fileMtimeMs: number;
+}
+
+const displayMetadataCache = new Map<string, DisplayMetadataCacheEntry>();
+
+/**
+ * Iterate physical JSONL lines from EOF towards the header.
+ *
+ * Session names are append-only metadata: Pi writes a new `session_info`
+ * whenever the name changes, and that entry is commonly near the *end* of a
+ * long transcript. Reading only the file head therefore returns a stale/missing
+ * name. Walking backwards also lets us find the last conversational activity
+ * without treating a later rename as new activity.
+ */
+function* readLinesReverse(filePath: string, chunkBytes = 64 * 1024): Generator<string> {
+  const fd = openSync(filePath, "r");
+  try {
+    let position = fstatSync(fd).size;
+    let suffix = Buffer.alloc(0);
+
+    while (position > 0) {
+      const length = Math.min(chunkBytes, position);
+      position -= length;
+      const buffer = Buffer.allocUnsafe(length);
+      const bytesRead = readSync(fd, buffer, 0, length, position);
+      if (bytesRead <= 0) break;
+
+      const prefix = buffer.subarray(0, bytesRead);
+      const data = suffix.length > 0 ? Buffer.concat([prefix, suffix]) : prefix;
+      let end = data.length;
+
+      for (let index = data.length - 1; index >= 0; index -= 1) {
+        if (data[index] !== 0x0a) continue;
+        const raw = data.subarray(index + 1, end);
+        end = index;
+        if (raw.length === 0) continue;
+        const line = raw.toString("utf8");
+        yield line.endsWith("\r") ? line.slice(0, -1) : line;
+      }
+
+      suffix = Buffer.from(data.subarray(0, end));
     }
+
+    if (suffix.length > 0) {
+      const line = suffix.toString("utf8");
+      yield line.endsWith("\r") ? line.slice(0, -1) : line;
+    }
+  } finally {
+    closeSync(fd);
   }
-  return name;
+}
+
+function conversationalActivityMs(entry: {
+  type?: unknown;
+  timestamp?: unknown;
+  message?: { role?: unknown; timestamp?: unknown };
+}): number | undefined {
+  if (entry.type !== "message") return undefined;
+  const role = entry.message?.role;
+  if (role !== "user" && role !== "assistant") return undefined;
+  if (typeof entry.message?.timestamp === "number" && Number.isFinite(entry.message.timestamp)) {
+    return entry.message.timestamp;
+  }
+  if (typeof entry.timestamp !== "string") return undefined;
+  const parsed = Date.parse(entry.timestamp);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+/**
+ * Match Pi Web's displayed session semantics:
+ *   - the first `session_info` encountered from EOF is the current name;
+ *   - the first valid user/assistant message from EOF is the last activity.
+ *
+ * The filesystem mtime is deliberately not activity: renaming a session appends
+ * metadata and touches mtime even though no conversation happened.
+ */
+function displayMetadataFromTail(
+  filePath: string,
+  stats: { mtimeMs: number; size: number },
+): DisplayMetadata {
+  const cached = displayMetadataCache.get(filePath);
+  if (cached && cached.size === stats.size && cached.fileMtimeMs === stats.mtimeMs) {
+    return cached;
+  }
+
+  let nameResolved = false;
+  let name: string | undefined;
+  let activityMs: number | undefined;
+
+  for (const line of readLinesReverse(filePath)) {
+    const mayContainName = !nameResolved && line.includes('"type":"session_info"');
+    const mayContainActivity =
+      activityMs === undefined
+      && (line.includes('"role":"user"') || line.includes('"role":"assistant"'));
+    if (!mayContainName && !mayContainActivity) continue;
+
+    let entry: {
+      type?: unknown;
+      name?: unknown;
+      timestamp?: unknown;
+      message?: { role?: unknown; timestamp?: unknown };
+    };
+    try {
+      entry = JSON.parse(line);
+    } catch {
+      continue;
+    }
+
+    if (!nameResolved && entry.type === "session_info") {
+      nameResolved = true;
+      name = typeof entry.name === "string" && entry.name.trim()
+        ? entry.name.trim()
+        : undefined;
+    }
+
+    if (activityMs === undefined) {
+      activityMs = conversationalActivityMs(entry);
+    }
+
+    if (nameResolved && activityMs !== undefined) break;
+  }
+
+  const result: DisplayMetadataCacheEntry = {
+    size: stats.size,
+    fileMtimeMs: stats.mtimeMs,
+    ...(name ? { name } : {}),
+    ...(activityMs !== undefined ? { activityMs } : {}),
+  };
+  displayMetadataCache.set(filePath, result);
+  return result;
 }
 
 function firstUserMessage(head: string): string | undefined {
@@ -109,6 +233,7 @@ export interface RawSessionInfo {
   name?: string;
   /** First user message, for a list preview. Read from the bounded head. */
   firstMessage?: string;
+  /** Last user/assistant activity time; filesystem mtime is only a fallback. */
   mtimeMs: number;
   size: number;
   /** True when the id came from the file name because the header was unusable. */
@@ -233,7 +358,7 @@ export function classifySessionFile(filePath: string, stats?: { mtimeMs: number;
         },
       };
     }
-    const record = header as { type?: unknown; id?: unknown; cwd?: unknown };
+    const record = header as { type?: unknown; id?: unknown; cwd?: unknown; timestamp?: unknown };
     if (record?.type !== "session" || typeof record.id !== "string") {
       return {
         problem: {
@@ -248,11 +373,19 @@ export function classifySessionFile(filePath: string, stats?: { mtimeMs: number;
     // sessions by the id inside the header, so that is the id to list and to
     // cascade on. Dropping the file would hide a real session - and a child -
     // from the graph, which is the one failure mode a cascade cannot survive.
+    const display = displayMetadataFromTail(filePath, stat);
+    const headerTime =
+      typeof record.timestamp === "string" ? Date.parse(record.timestamp) : Number.NaN;
     const info: RawSessionInfo = {
       ...base,
+      // Keep this historical field name for callers, but its value is the
+      // displayed conversational activity time, not the filesystem mtime.
+      mtimeMs:
+        display.activityMs
+        ?? (Number.isFinite(headerTime) ? headerTime : stat.mtimeMs),
       id: record.id,
       cwd: typeof record.cwd === "string" ? record.cwd : undefined,
-      name: sessionNameFromHead(head),
+      name: display.name,
       firstMessage: firstUserMessage(head),
       idFromFileName: false,
     };
