@@ -563,7 +563,10 @@ test("a filesystem failure is reported, not thrown at the user", async (t) => {
   const { commands } = await register(agentDir);
   // Pick by label, the way a person does: the row text, not a bare id.
   const { notices, ui } = scriptedSelect(
-    [["#p1", (options) => options.find((option) => option.includes("#p1"))]],
+    [
+      ["#p1", (options) => options.find((option) => option.includes("#p1"))],
+      ["Archive selected", (options) => options.find((option) => option.includes("Archive selected"))],
+    ],
     { defaultFirst: false },
   );
   const { ctx } = fakeContext({ ui });
