@@ -24,6 +24,46 @@ test("a well-formed session is classified with id and cwd from its header", asyn
   assert.equal(info.idFromFileName, false);
 });
 
+test("title fallback is not limited to the first 64KB", async (t) => {
+  const agentDir = makeAgentDir(t);
+  const file = writeSessionFile(agentDir, {
+    id: "late-first-user",
+    cwd: "/data/proj",
+    firstMessage: "",
+  });
+
+  // Replace the default message with a large non-user entry, then put the first
+  // real user message after the old 64KB boundary. There is no session_info, so
+  // the archive row must fall back to this actual first user message.
+  const header = fs.readFileSync(file, "utf8").split("\n")[0];
+  fs.writeFileSync(
+    file,
+    [
+      header,
+      JSON.stringify({
+        type: "message",
+        id: "noise",
+        parentId: null,
+        timestamp: "2026-09-04T09:59:59.000Z",
+        message: { role: "toolResult", content: "x".repeat(80_000), timestamp: Date.parse("2026-09-04T09:59:59.000Z") },
+      }),
+      JSON.stringify({
+        type: "message",
+        id: "u1",
+        parentId: "noise",
+        timestamp: "2026-09-04T10:00:00.000Z",
+        message: { role: "user", content: "真正的第一条用户消息", timestamp: Date.parse("2026-09-04T10:00:00.000Z") },
+      }),
+      "",
+    ].join("\n"),
+  );
+
+  const { info, problem } = classifySessionFile(file);
+  assert.equal(problem, undefined);
+  assert.equal(info.name, undefined);
+  assert.equal(info.firstMessage, "真正的第一条用户消息");
+});
+
 test("latest session_info from the tail wins, without turning rename time into activity", async (t) => {
   const agentDir = makeAgentDir(t);
   const conversationAt = "2026-09-04T10:00:00.000Z";
