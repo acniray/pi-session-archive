@@ -203,7 +203,7 @@ test("the archive command lists roots, archives the pick, and leaves forks alone
 
   const { calls, notices, ui } = scriptedSelect([
     ["work on archiving", (options) => options.find((option) => option.includes("work on archiving"))],
-    ["No - I'm done", "No - I'm done"],
+    ["Archive selected", (options) => options.find((option) => option.includes("Archive selected"))],
   ], { defaultFirst: false });
   const { ctx } = fakeContext({ mode: "rpc", ui });
   ctx.newSession = async () => {
@@ -215,16 +215,16 @@ test("the archive command lists roots, archives the pick, and leaves forks alone
 
   await commands.get("archive").handler("", ctx);
 
-  const listCall = calls.find((call) => call.title.startsWith("Archive a session"));
+  const listCall = calls.find((call) => call.title.startsWith("Archive sessions"));
   assert.ok(listCall, `the session list was shown: ${JSON.stringify(calls.map((c) => c.title))}`);
-  assert.equal(listCall.options.length, 2, "two roots, the subagent child is not offered");
+  assert.equal(listCall.options.filter((option) => option.startsWith("[ ]")).length, 2, "two roots, the subagent child is not offered");
   assert.ok(
     listCall.options.some((option) => /work on archiving/.test(option) && /1 subagent/.test(option)),
     `rows carry the subagent count: ${JSON.stringify(listCall.options)}`,
   );
   assert.ok(
-    calls.some((call) => call.title === "Archive more?"),
-    "and the user is offered another one instead of typing the command again",
+    calls.some((call) => call.options.some((option) => option.includes("Archive selected (1)"))),
+    "the same picker accumulates the selection before one final archive action",
   );
 
   const { archiveRoot } = await import("./paths.ts");
@@ -232,6 +232,28 @@ test("the archive command lists roots, archives the pick, and leaves forks alone
   assert.equal(fs.existsSync(parent), false, "the root moved");
   assert.equal(fs.existsSync(sibling), true, "the other root stayed");
   assert.ok(notices.some((entry) => /Archived/.test(entry.message)), `told the user: ${JSON.stringify(notices)}`);
+});
+
+test("/archive --ids archives several roots without opening a picker", async (t) => {
+  const agentDir = makeAgentDir(t);
+  const { commands } = await register(agentDir);
+  const first = writeSessionFile(agentDir, { id: "direct-a", cwd: "/data/proj", firstMessage: "first" });
+  const second = writeSessionFile(agentDir, { id: "direct-b", cwd: "/data/proj", firstMessage: "second" });
+  const { ctx, notices } = fakeContext({
+    mode: "rpc",
+    ui: {
+      notify: (message, level) => notices.push({ message, level }),
+      select: async () => {
+        throw new Error("direct ids must not open a picker");
+      },
+    },
+  });
+
+  await commands.get("archive").handler("--ids direct-a,direct-b", ctx);
+
+  assert.equal(fs.existsSync(first), false);
+  assert.equal(fs.existsSync(second), false);
+  assert.ok(notices.some((entry) => /Archived 2 root session/.test(entry.message)), JSON.stringify(notices));
 });
 
 test("rows put the human name first without reading whole transcripts", async (t) => {
@@ -262,8 +284,8 @@ test("rows put the human name first without reading whole transcripts", async (t
 
   await commands.get("archive").handler("", ctx);
 
-  const row = calls.find((call) => call.title.startsWith("Archive a session")).options[0];
-  assert.match(row, /^release notes ·/, "the name comes first, so the row is recognisable");
+  const row = calls.find((call) => call.title.startsWith("Archive sessions")).options[0];
+  assert.match(row, /^\[ \] release notes ·/, "the name comes first after the selection marker, so the row is recognisable");
   assert.match(row, /proj/, "the project gives the title context");
   assert.match(row, /just now|ago/, "the row carries a compact relative time");
   assert.match(row, /#n1$/, "and a stable id token remains at the end");
@@ -296,10 +318,10 @@ test("a long list is paged instead of showing one screenful", async (t) => {
 
   await commands.get("archive").handler("", ctx);
 
-  const pages = calls.filter((call) => call.title.startsWith("Archive a session"));
+  const pages = calls.filter((call) => call.title.startsWith("Archive sessions"));
   assert.equal(pages.length, 2, "asked for page two");
-  assert.equal(pages[0].options.length, 21, "20 rows plus a next-page control");
-  assert.equal(pages[1].options.length, 6, "5 rows plus a previous-page control");
+  assert.equal(pages[0].options.length, 22, "20 rows plus next-page and cancel controls");
+  assert.equal(pages[1].options.length, 7, "5 rows plus previous-page and cancel controls");
   assert.match(pages[0].title, /page 1\/2/);
   assert.match(pages[1].title, /page 2\/2/);
   // Newest first: page one holds the 20 newest, page two the 5 oldest.
@@ -319,7 +341,7 @@ test("a subagent session left behind after an archive is reported, not silent", 
 
   const { notices, ui } = scriptedSelect([
     ["parent", (options) => options.find((option) => option.includes("parent"))],
-    ["No - I'm done", "No - I'm done"],
+    ["Archive selected", (options) => options.find((option) => option.includes("Archive selected"))],
   ], { defaultFirst: false });
   const { ctx } = fakeContext({ mode: "rpc", ui });
   ctx.waitForIdle = async () => {};
@@ -367,7 +389,7 @@ test("P1: a pick is resolved by id, not by the text that was drawn", async (t) =
       // Answer the *second* row, and with a label whose time has since moved on,
       // exactly what happens when a picker sits open for a minute.
       ["#b", (options) => options.find((option) => option.endsWith("#b"))],
-      ["No - I'm done", "No - I'm done"],
+      ["Archive selected", (options) => options.find((option) => option.includes("Archive selected"))],
     ],
     { defaultFirst: false },
   );
@@ -435,7 +457,7 @@ test("REGRESSION: the list works when the host reports a project dir, not a root
   const { calls, ui } = scriptedSelect(
     [
       ["project one", (options) => options.find((option) => option.includes("project one"))],
-      ["No - I'm done", "No - I'm done"],
+      ["Archive selected", (options) => options.find((option) => option.includes("Archive selected"))],
     ],
     { defaultFirst: false },
   );
@@ -448,7 +470,7 @@ test("REGRESSION: the list works when the host reports a project dir, not a root
 
   await commands.get("archive").handler("", ctx);
 
-  const listCall = calls.find((call) => call.title.startsWith("Archive a session"));
+  const listCall = calls.find((call) => call.title.startsWith("Archive sessions"));
   assert.ok(listCall, `the session list was shown: ${JSON.stringify(calls.map((c) => c.title))}`);
   assert.ok(
     listCall.options.some((option) => /project one/.test(option)),
@@ -476,7 +498,7 @@ test("the session this runtime is using is refused, by path", async (t) => {
   const { ui, calls } = scriptedSelect(
     [
       ["the active one", (options) => options.find((option) => option.includes("the active one"))],
-      ["No - I'm done", "No - I'm done"],
+      ["Archive selected", (options) => options.find((option) => option.includes("Archive selected"))],
     ],
     { defaultFirst: false, notices },
   );
@@ -487,14 +509,14 @@ test("the session this runtime is using is refused, by path", async (t) => {
 
   await commands.get("archive").handler("", ctx);
 
-  const listCall = calls.find((call) => call.title.startsWith("Archive a session"));
+  const listCall = calls.find((call) => call.title.startsWith("Archive sessions"));
   assert.ok(
     listCall?.options.some((option) => option.includes("the active one") && option.includes("current session")),
     `the current row is marked in the picker: ${JSON.stringify(listCall?.options)}`,
   );
   assert.ok(
-    notices.some((entry) => /Cannot archive the currently active session/.test(entry.message)),
-    `the refusal explains itself: ${JSON.stringify(notices)}`,
+    notices.some((entry) => /current session/i.test(entry.message)),
+    `the disabled row explains itself: ${JSON.stringify(notices)}`,
   );
   assert.equal(fs.existsSync(mine), true, "and the file did not move");
   assert.equal(fs.existsSync(other), true, "and nothing else was touched either");
@@ -510,7 +532,7 @@ test("a different session is archived even while this one is running", async (t)
   const { ui } = scriptedSelect(
     [
       ["a different one", (options) => options.find((option) => option.includes("a different one"))],
-      ["No - I'm done", "No - I'm done"],
+      ["Archive selected", (options) => options.find((option) => option.includes("Archive selected"))],
     ],
     { defaultFirst: false, notices },
   );
