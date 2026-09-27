@@ -24,6 +24,69 @@ test("a well-formed session is classified with id and cwd from its header", asyn
   assert.equal(info.idFromFileName, false);
 });
 
+test("latest session_info from the tail wins, without turning rename time into activity", async (t) => {
+  const agentDir = makeAgentDir(t);
+  const conversationAt = "2026-09-04T10:00:00.000Z";
+  const renameAt = "2026-09-26T19:23:58.411Z";
+  const file = writeSessionFile(agentDir, {
+    id: "renamed",
+    cwd: "/data/proj",
+    firstMessage: "original title",
+    messageAt: conversationAt,
+    mtime: conversationAt,
+  });
+
+  // Push the later session_info well beyond the old 64KB head window.
+  fs.appendFileSync(
+    file,
+    [
+      JSON.stringify({
+        type: "message",
+        id: "tool-noise",
+        parentId: "e1",
+        timestamp: "2026-09-04T10:00:01.000Z",
+        message: { role: "toolResult", content: "x".repeat(80_000), timestamp: Date.parse(conversationAt) + 1_000 },
+      }),
+      JSON.stringify({
+        type: "session_info",
+        id: "rename-entry",
+        parentId: "tool-noise",
+        timestamp: renameAt,
+        name: "补齐充值记录确认到账功能C1",
+      }),
+      "",
+    ].join("\n"),
+  );
+
+  const renameTime = new Date(renameAt);
+  fs.utimesSync(file, renameTime, renameTime);
+
+  const { info, problem } = classifySessionFile(file);
+  assert.equal(problem, undefined);
+  assert.equal(info.name, "补齐充值记录确认到账功能C1");
+  assert.equal(
+    info.mtimeMs,
+    Date.parse(conversationAt),
+    "a later session_info/file mtime must not make an old conversation look recent",
+  );
+});
+
+test("the newest session_info entry wins when a session is renamed more than once", async (t) => {
+  const agentDir = makeAgentDir(t);
+  const file = writeSessionFile(agentDir, { id: "rename-chain", cwd: "/data/proj" });
+  fs.appendFileSync(
+    file,
+    [
+      JSON.stringify({ type: "session_info", id: "n1", parentId: "e1", timestamp: "2026-09-25T10:00:00.000Z", name: "old name" }),
+      JSON.stringify({ type: "session_info", id: "n2", parentId: "n1", timestamp: "2026-09-25T11:00:00.000Z", name: "new name" }),
+      "",
+    ].join("\n"),
+  );
+
+  const { info } = classifySessionFile(file);
+  assert.equal(info.name, "new name");
+});
+
 test("a headerless fragment is reported, not silently dropped", async (t) => {
   const agentDir = makeAgentDir(t);
   const dir = path.join(archiveRoot(agentDir));
