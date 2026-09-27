@@ -2,12 +2,16 @@
 
 Archive Pi sessions by moving their JSONL files out of Pi's active session tree.
 Archived files live under `<agentDir>/session-archive/`, so they disappear from
-Pi `/resume` and from PI WEB without modifying either host.
+Pi's active session catalogue. PI WEB can optionally expose native row/batch
+archive controls; those controls only appear when this extension is detected and
+delegate all mutations back to the extension.
 
 ## Commands
 
-- `/archive [filter]` - choose an active root session and archive it together
-  with the subagent sessions that are already present on disk.
+- `/archive [filter]` - multi-select active root sessions and archive each
+  selected root together with the subagent sessions already present on disk.
+- `/archive --ids <id[,id...]>` - non-interactive integration form used by
+  hosts such as PI WEB. It uses the same archive engine and safety checks.
 - `/archived [filter]` - browse archived roots, then restore/open or export one.
 - `/unarchive <id-or-text>` - restore an archived root and its archived
   descendants.
@@ -16,7 +20,10 @@ Pi `/resume` and from PI WEB without modifying either host.
 - `/archive-check` - diagnostics for split trees, duplicate files and malformed
   archive state. Diagnostics never become a global gate for unrelated sessions.
 
-Ctrl+Shift+A opens the archive picker in Pi TUI. PI WEB should use `/archive`.
+Ctrl+Shift+A opens the archive picker in Pi TUI. In TUI the picker is a true
+single-screen multi-select (Space toggles, Enter commits). Generic RPC hosts get
+a selection-basket fallback. PI WEB's native session-list integration uses the
+`--ids` form, so browser users do not bounce through extension dialogs.
 
 ## Safety model
 
@@ -51,7 +58,9 @@ resulting split; archive correctness does not depend on predicting it.
 
 ## Picker design
 
-Rows are written for people first and machines second. Active rows look like:
+Rows are written for people first and machines second. In a generic picker,
+selection state is rendered separately from the row content. Active rows look
+like:
 
 ```text
 Fix auth flow · sms-gateway · 12m ago · 2 subagents · #a1b2c3d4
