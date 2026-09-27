@@ -10,6 +10,7 @@
  * single-screen multi-select: arrows move, Space toggles, Enter commits.
  */
 
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 
 export interface PagedSelectOptions {
@@ -97,25 +98,7 @@ export interface MultiSelectOptions {
   commitVerb?: string;
 }
 
-type MultiSelectContext = {
-  mode?: string;
-  ui: {
-    select(title: string, options: string[], opts?: unknown): Promise<string | undefined>;
-    notify?(message: string, type?: "info" | "warning" | "error"): void;
-    custom?<T>(
-      factory: (
-        tui: { requestRender(): void },
-        theme: {
-          fg(kind: string, text: string): string;
-          bold(text: string): string;
-        },
-        keybindings: unknown,
-        done: (value: T) => void,
-      ) => unknown,
-      opts?: unknown,
-    ): Promise<T | undefined>;
-  };
-};
+type MultiSelectContext = Pick<ExtensionContext, "mode" | "ui">;
 
 function heading(title: string, suffix: string | undefined): string {
   return suffix ? `${title} — ${suffix}` : title;
@@ -156,11 +139,11 @@ async function selectManyRpc(
     if (selected.size > 0) controls.push(`✓ ${commitVerb} selected (${selected.size})`);
     if (page > 1) controls.push(`${PREVIOUS} previous page`);
     if (page < pages) controls.push(`${NEXT} next page (${pages} pages)`);
-    controls.push("Cancel");
+    controls.push("No - I'm done");
 
     const titleText = `${heading(title, options.titleSuffix)} · page ${page}/${pages} · ${selected.size} selected`;
     const picked = await ctx.ui.select(titleText, [...rendered, ...controls]);
-    if (!picked || picked === "Cancel") return [];
+    if (!picked || picked === "No - I'm done") return [];
 
     if (picked === `${PREVIOUS} previous page`) {
       page = Math.max(1, page - 1);
@@ -201,7 +184,7 @@ async function selectManyTui(
   const pageSize = Math.max(1, options.pageSize ?? 20);
   const commitVerb = options.commitVerb ?? "Archive";
   const result = await ctx.ui.custom<string[] | null>((tui, theme, _keybindings, done) => {
-    let cursor = 0;
+    let cursor = Math.max(0, items.findIndex((item) => !item.disabled));
     let scroll = 0;
     const selected = new Set<string>();
 
