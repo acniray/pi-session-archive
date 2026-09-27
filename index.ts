@@ -247,10 +247,10 @@ export default function sessionArchiveExtension(pi: ExtensionAPI): void {
    * browser owns only presentation; all archive semantics remain here.
    */
   const directArchiveIds = (raw: string | undefined): string[] | undefined => {
-    const match = /^--ids(?:\\s+(.+))?$/i.exec((raw ?? "").trim());
+    const match = /^--ids(?:\s+(.+))?$/i.exec((raw ?? "").trim());
     if (!match) return undefined;
     return (match[1] ?? "")
-      .split(/[\\s,]+/)
+      .split(/[\s,]+/)
       .map((id) => id.trim())
       .filter(Boolean);
   };
