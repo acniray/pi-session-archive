@@ -2,7 +2,7 @@
   "name": "pi-session-archive",
   "version": "0.1.0",
   "private": true,
-  "description": "Archive pi sessions by moving them out of the active session root; pi-web sees the change with no code change of its own.",
+  "description": "Archive Pi sessions with durable subagent cascades, multi-select, restore, and optional PI WEB integration.",
   "keywords": [
     "pi-package"
   ],
