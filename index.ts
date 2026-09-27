@@ -41,8 +41,8 @@ import { homedir } from "node:os";
 import { basename, dirname } from "node:path";
 import { resolveArchivedTarget } from "./archive-flow.ts";
 import { describeReachability, exportArchivedSessionHtml } from "./export-html.ts";
-import { describeActiveRow, idFromLabel, listActiveRoots, rowTitle, uniqueIdPrefixes } from "./active-list.ts";
-import { archiveManyInOneGo, selectPaged } from "./picker.ts";
+import { describeActiveRow, listActiveRoots, rowTitle, uniqueIdPrefixes } from "./active-list.ts";
+import { selectMany, selectPaged } from "./picker.ts";
 import { findSessionPathByIdHint } from "./locate-session.ts";
 import {
   archiveSessionTree,
@@ -193,100 +193,145 @@ export default function sessionArchiveExtension(pi: ExtensionAPI): void {
     isHostActiveFile: isHostActiveFile(ctx),
   });
 
+  interface ArchiveBatchSummary {
+    rootsArchived: number;
+    sessionsMoved: number;
+    failed: number;
+  }
+
   /**
-   * Archive a session the user picks.
-   *
-   * Archiving is a list action. Picking a session that is not the one running
-   * this command needs no session switch at all, which is why it works in a
-   * browser too; picking "the session I am in" is simply refused.
+   * Archive stable root ids through the same migration path used by the
+   * interactive picker. Each root performs its own lock-time rescan, so a
+   * selection made from a stale UI can never become filesystem authority.
    */
-  /** Archive one picked row, or return false when the user backed out. */
-  const archivePickedRow = async (ctx: ExtensionContext, label: string): Promise<boolean> => {
-    // Resolve by the id embedded in the label, never by matching the whole
-    // label: the relative time in it moves while the user is looking at it.
-    const shortId = idFromLabel(label);
-    const listed = await run(ctx, "Refresh session list", () =>
-      listActiveRoots({ agentDir: agentDir(), sessionRoots: sessionRootsFrom(ctx, agentDir() ?? "") }),
-    );
-    if (!listed) return false;
-    const exact = shortId ? listed.rows.filter((row) => row.session.id === shortId) : [];
-    const candidates = exact.length > 0
-      ? exact
-      : shortId
-        ? listed.rows.filter((row) => row.session.id.startsWith(shortId))
-        : [];
-    if (candidates.length !== 1) {
+  const archiveSessionIds = async (
+    ctx: ExtensionContext,
+    ids: readonly string[],
+  ): Promise<ArchiveBatchSummary> => {
+    const uniqueIds = [...new Set(ids.map((id) => id.trim()).filter(Boolean))];
+    let rootsArchived = 0;
+    let sessionsMoved = 0;
+    let failed = 0;
+
+    for (const id of uniqueIds) {
+      const result = await run(ctx, "Archive", () => archiveSessionTree(id, migrationDeps(ctx)));
+      if (!result) {
+        failed += 1;
+        continue;
+      }
+      if (!result.ok) {
+        failed += 1;
+        report(ctx, result, "Archived");
+        continue;
+      }
+      rootsArchived += 1;
+      sessionsMoved += result.affected.length;
+      for (const warning of result.warnings ?? []) notify(ctx, warning, "warning");
+    }
+
+    if (rootsArchived > 0) {
       notify(
         ctx,
-        candidates.length === 0
-          ? "That session is no longer in the list."
-          : "That short session id is no longer unique. Run /archive again.",
-        "warning",
+        `Archived ${rootsArchived} root session(s) (${sessionsMoved} session file(s)).`,
+        "info",
       );
-      return false;
     }
-    const picked = candidates[0]!;
-
-    // The one rule: you cannot archive the session this runtime is using. We
-    // compare paths, because that is the file that would be moved. Everything
-    // else goes through, including a session some other pi has open - that is
-    // pi's own behaviour for delete, and being stricter here only breaks
-    // legitimate use.
-    if (isHostActiveFile(ctx)(picked.session.path)) {
-      notify(ctx, "Cannot archive the currently active session. Switch to another session first.", "warning");
-      return false;
+    if (failed > 0) {
+      notify(ctx, `${failed} selected session(s) were not archived.`, "warning");
     }
 
-    const result = await run(ctx, "Archive", () => archiveSessionTree(picked.session.id, migrationDeps(ctx)));
-    if (!result) return false;
-    if (!result.ok) report(ctx, result, "Archived");
-    else for (const warning of result.warnings ?? []) notify(ctx, warning, "warning");
-    return result.ok;
+    return { rootsArchived, sessionsMoved, failed };
   };
 
   /**
-   * The archive command: a paged list, and a loop, because archiving one session
-   * and then having to type the command again for the next one is what makes
-   * tidying up annoying.
+   * Pi Web integration form. Kept inside the existing archive command so the
+   * browser owns only presentation; all archive semantics remain here.
+   */
+  const directArchiveIds = (raw: string | undefined): string[] | undefined => {
+    const match = /^--ids(?:\\s+(.+))?$/i.exec((raw ?? "").trim());
+    if (!match) return undefined;
+    return (match[1] ?? "")
+      .split(/[\\s,]+/)
+      .map((id) => id.trim())
+      .filter(Boolean);
+  };
+
+  /**
+   * Interactive archive picker.
+   *
+   * TUI uses one true multi-select component. RPC keeps a selection basket as a
+   * compatibility fallback; Pi Web's native session-list integration calls the
+   * --ids form and never shows this picker.
    */
   const archivePickedSession = async (ctx: ExtensionContext, filter?: string): Promise<void> => {
+    const directIds = directArchiveIds(filter);
+    if (directIds !== undefined) {
+      if (directIds.length === 0) {
+        notify(ctx, "Usage: /archive --ids <session-id[,session-id...]>", "warning");
+        return;
+      }
+      await archiveSessionIds(ctx, directIds);
+      return;
+    }
+
     if (!INTERACTIVE_MODES.has(ctx.mode)) {
       notify(ctx, "Archiving needs a terminal or web session.", "warning");
       return;
     }
+
     const needle = (filter ?? "").trim().toLowerCase();
-    let warnedScanIssues = false;
+    const listed = await run(ctx, "Archive picker", () =>
+      listActiveRoots({
+        agentDir: agentDir(),
+        sessionRoots: sessionRootsFrom(ctx, agentDir() ?? ""),
+      }),
+    );
+    if (!listed) return;
 
-    const outcome = await run(ctx, "Archive picker", () => archiveManyInOneGo(ctx, {
-      title: "Archive a session",
-      pageSize: 20,
-      titleSuffix: needle ? `matching "${filter}"` : undefined,
-      emptyLabel: "No sessions to archive.",
-      rows: async () => {
-        const nowMs = Date.now();
-        const { rows, problems } = await listActiveRoots({ agentDir: agentDir(), sessionRoots: sessionRootsFrom(ctx, agentDir() ?? "") });
-        if (problems.length > 0 && !warnedScanIssues) {
-          warnedScanIssues = true;
-          notify(ctx, `Session scan found ${problems.length} issue(s); /archive-check has details.`, "warning");
-        }
-        const matching = rows.filter(
-          (row) =>
-            needle === "" ||
-            `${rowTitle(row)} ${row.session.cwd ?? ""} ${row.session.id}`.toLowerCase().includes(needle),
-        );
-        const idTokens = uniqueIdPrefixes(matching.map((row) => row.session.id));
+    if (listed.problems.length > 0) {
+      notify(ctx, `Session scan found ${listed.problems.length} issue(s); /archive-check has details.`, "warning");
+    }
+
+    const matching = listed.rows.filter(
+      (row) =>
+        needle === ""
+        || `${rowTitle(row)} ${row.session.cwd ?? ""} ${row.session.id}`.toLowerCase().includes(needle),
+    );
+    if (matching.length === 0) {
+      notify(
+        ctx,
+        listed.rows.length === 0
+          ? "No sessions to archive."
+          : `No active session matches "${filter?.trim() ?? ""}".`,
+        "warning",
+      );
+      return;
+    }
+
+    const nowMs = Date.now();
+    const idTokens = uniqueIdPrefixes(matching.map((row) => row.session.id));
+    const selectedIds = await selectMany(
+      ctx,
+      "Archive sessions",
+      matching.map((row) => {
+        const current = isHostActiveFile(ctx)(row.session.path);
         return {
-          rows: matching.map((row) =>
-            describeActiveRow(row, nowMs, idTokens.get(row.session.id), isHostActiveFile(ctx)(row.session.path)),
-          ),
+          value: row.session.id,
+          label: describeActiveRow(row, nowMs, idTokens.get(row.session.id), current),
+          disabled: current,
+          disabledReason: current ? "current session" : undefined,
         };
+      }),
+      {
+        pageSize: 20,
+        titleSuffix: needle ? `matching "${filter}"` : undefined,
+        emptyLabel: "No sessions to archive.",
+        commitVerb: "Archive",
       },
-      archive: (label) => archivePickedRow(ctx, label),
-      describe: (label) => `Archived: ${label}`,
-    }));
-    if (!outcome) return;
+    );
 
-    void outcome;
+    if (selectedIds.length === 0) return;
+    await archiveSessionIds(ctx, selectedIds);
   };
 
   /**
@@ -323,7 +368,7 @@ export default function sessionArchiveExtension(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("archive", {
-    description: "Pick a session to archive, with its subagent sessions (usage: /archive [filter])",
+    description: "Archive one or more sessions with their subagents (usage: /archive [filter])",
     handler: async (args, ctx) => archivePickedSession(ctx, args),
   });
 
