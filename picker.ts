@@ -98,7 +98,7 @@ export interface MultiSelectOptions {
   commitVerb?: string;
 }
 
-type MultiSelectContext = Pick<ExtensionContext, "mode" | "ui">;
+type MultiSelectContext = { mode?: string; ui: ExtensionContext["ui"] };
 
 function heading(title: string, suffix: string | undefined): string {
   return suffix ? `${title} — ${suffix}` : title;
