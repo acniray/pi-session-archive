@@ -1,12 +1,12 @@
 /**
  * pi-session-archive: archive sessions by moving them out of the active tree.
  *
- * What it does, and why pi-web needs no change:
+ * What it does:
  *   pi scans `<agentDir>/sessions/<project>/*.jsonl`. The archive root is a flat
- *   *sibling* of that directory, so an archived file stops appearing in
- *   `/resume` and in pi-web's sidebar simply by not being there. pi-web already
- *   loads and binds extensions and bridges their UI, so the commands and the
- *   archive commands work in both hosts.
+ *   sibling of that directory, so moving a file removes it from the active
+ *   catalogue. The extension owns every mutation. Hosts may either use its
+ *   interactive commands or call the stable `/archive --ids ...` integration
+ *   form; PI WEB's optional native archive controls use the latter.
  *
  * Ownership, matching pi's own rule for deleting a session: you may not archive
  * the session this runtime is using, and nothing else is checked. pi does not
@@ -14,12 +14,11 @@
  * two runtimes on one session both carry on typing, as they would without us.
  *
  * Where each entry point actually works, as host facts rather than wishes:
- *   - `/archive` and Ctrl+Shift+A list the sessions and archive the one you
- *     pick. The shortcut fires from the prompt editor, which is the only place
- *     pi routes extension keys to (`defaultEditor.onExtensionShortcut`); it does
- *     not fire inside the
- *     built-in `/resume` list, which exposes no extension hook, and pi-web does
- *     not wire the channel at all. In a browser, use the command.
+ *   - `/archive` and Ctrl+Shift+A open a multi-select archive picker. The
+ *     shortcut fires from the prompt editor, which is the only place pi routes
+ *     extension keys to; it does not fire inside the built-in `/resume` list.
+ *   - `/archive --ids <id[,id...]>` is the non-interactive host integration
+ *     path. It deliberately bypasses picker UI but uses the same migration code.
  *   - `/archived` lists archived roots in a human-readable picker. Subagent
  *     children are folded into their root, while a stable trailing #id keeps the
  *     selection unambiguous.
@@ -355,15 +354,14 @@ export default function sessionArchiveExtension(pi: ExtensionAPI): void {
   };
 
   /**
-   * A key to archive the session you are in.
+   * A key to open the archive picker.
    *
    * pi routes extension shortcuts to the prompt editor, which is why this fires
    * while typing and not inside the built-in `/resume` list (that list has no
-   * extension hook at all). pi-web does not wire the channel, so in a browser the
-   * command palette entry is the route.
+   * extension hook at all).
    */
   pi.registerShortcut(Key.ctrlShift("a"), {
-    description: "Pick a session to archive (with its subagent sessions)",
+    description: "Select sessions to archive (with their subagent sessions)",
     handler: async (ctx) => archivePickedSession(ctx),
   });
 
