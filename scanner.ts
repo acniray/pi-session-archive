@@ -16,26 +16,6 @@ import { sessionIdFromFileName } from "./paths.ts";
 export const SUBAGENT_META_TYPE = "pi-web:subagent";
 
 /**
- * Bounded read of the head of a file.
- *
- * `readFileSync` then `slice(0, N)` reads the whole file and throws the rest away:
- * with hundreds of multi-megabyte sessions that is hundreds of megabytes of I/O
- * to look at one header. This reads at most `maxBytes` and stops.
- */
-export function readHead(filePath: string, maxBytes: number): string {
-  const fd = openSync(filePath, "r");
-  try {
-    const buffer = Buffer.allocUnsafe(maxBytes);
-    const read = readSync(fd, buffer, 0, maxBytes, 0);
-    return buffer.subarray(0, read).toString("utf8");
-  } finally {
-    closeSync(fd);
-  }
-}
-
-/** Enough for the header, the first message and, in practice, the relation entry. */
-const HEADER_READ_BYTES = 64 * 1024;
-/**
  * How many lines of a session file are searched for the relation entry.
  *
  * The bound is on line *position*, not on bytes, and that distinction is the
@@ -73,6 +53,7 @@ const HEADER_LINE_MAX_BYTES = 1024 * 1024;
 interface DisplayMetadata {
   name?: string;
   activityMs?: number;
+  firstMessage?: string;
 }
 
 interface DisplayMetadataCacheEntry extends DisplayMetadata {
@@ -165,19 +146,25 @@ function displayMetadataFromTail(
   let nameResolved = false;
   let name: string | undefined;
   let activityMs: number | undefined;
+  let firstMessage: string | undefined;
 
   for (const line of readLinesReverse(filePath)) {
     const mayContainName = !nameResolved && line.includes('"type":"session_info"');
     const mayContainActivity =
       activityMs === undefined
       && (line.includes('"role":"user"') || line.includes('"role":"assistant"'));
-    if (!mayContainName && !mayContainActivity) continue;
+    // If there is no current name, the picker falls back to the *first* user
+    // message. Because we are walking backwards, keep replacing this value:
+    // the last one assigned is the earliest user message in the transcript.
+    const mayContainFirstUser =
+      (!nameResolved || name === undefined) && line.includes('"role":"user"');
+    if (!mayContainName && !mayContainActivity && !mayContainFirstUser) continue;
 
     let entry: {
       type?: unknown;
       name?: unknown;
       timestamp?: unknown;
-      message?: { role?: unknown; timestamp?: unknown };
+      message?: { role?: unknown; timestamp?: unknown; content?: unknown };
     };
     try {
       entry = JSON.parse(line);
@@ -196,7 +183,19 @@ function displayMetadataFromTail(
       activityMs = conversationalActivityMs(entry);
     }
 
-    if (nameResolved && activityMs !== undefined) break;
+    if (
+      entry.type === "message"
+      && entry.message?.role === "user"
+      && (!nameResolved || name === undefined)
+    ) {
+      const text = messageText(entry.message.content);
+      if (text) firstMessage = text;
+    }
+
+    // A usable current name means the first-message fallback is irrelevant.
+    // Otherwise continue to the header so the reverse walk can settle on the
+    // earliest user message as well as prove that no later session_info exists.
+    if (nameResolved && name !== undefined && activityMs !== undefined) break;
   }
 
   const result: DisplayMetadataCacheEntry = {
@@ -204,24 +203,10 @@ function displayMetadataFromTail(
     fileMtimeMs: stats.mtimeMs,
     ...(name ? { name } : {}),
     ...(activityMs !== undefined ? { activityMs } : {}),
+    ...(firstMessage ? { firstMessage } : {}),
   };
   displayMetadataCache.set(filePath, result);
   return result;
-}
-
-function firstUserMessage(head: string): string | undefined {
-  for (const line of head.split("\n").slice(1)) {
-    if (!line.includes('"role":"user"')) continue;
-    try {
-      const entry = JSON.parse(line) as { type?: string; message?: { role?: string; content?: unknown } };
-      if (entry.type !== "message" || entry.message?.role !== "user") continue;
-      const text = messageText(entry.message.content);
-      if (text) return text;
-    } catch {
-      // A malformed line simply is not the preview.
-    }
-  }
-  return undefined;
 }
 
 export interface RawSessionInfo {
@@ -231,7 +216,7 @@ export interface RawSessionInfo {
   cwd?: string;
   /** Display name from the latest `session_info` entry, if the session has one. */
   name?: string;
-  /** First user message, for a list preview. Read from the bounded head. */
+  /** First user message, used only as the title fallback when no current name exists. */
   firstMessage?: string;
   /** Last user/assistant activity time; filesystem mtime is only a fallback. */
   mtimeMs: number;
@@ -291,29 +276,53 @@ export interface SubagentMeta {
 }
 
 function readHeaderLine(filePath: string): {
-  /** The bounded head, which also carries the first message for the preview. */
-  head: string;
-  /** The header line on its own, read whole. */
+  /** The first physical line, read whole when it fits the per-line cap. */
   firstLine: string;
   truncated: boolean;
   oversize?: boolean;
 } {
-  // Bounded for real: a whole-file read here costs hundreds of megabytes across
-  // a large session set, to look at one header line.
-  const head = readHead(filePath, HEADER_READ_BYTES);
-  const newline = head.indexOf("\n");
-  if (newline >= 0) return { head, firstLine: head.slice(0, newline), truncated: false };
-  // No newline in the window: the header line is either longer than the window
-  // or the file has no newline at all. Keep reading up to a much larger cap
-  // before calling it anything - a header cut in half is a session we have not
-  // read, not a file we have ruled out.
-  if (statSync(filePath).size <= HEADER_READ_BYTES) return { head, firstLine: head, truncated: false };
-  const longer = readHead(filePath, HEADER_LINE_MAX_BYTES);
-  const laterNewline = longer.indexOf("\n");
-  if (laterNewline >= 0) {
-    return { head, firstLine: longer.slice(0, laterNewline), truncated: false };
+  const fd = openSync(filePath, "r");
+  try {
+    const chunks: Buffer[] = [];
+    let total = 0;
+    let position = 0;
+
+    while (total <= HEADER_LINE_MAX_BYTES) {
+      const buffer = Buffer.allocUnsafe(Math.min(16 * 1024, HEADER_LINE_MAX_BYTES + 1 - total));
+      const bytesRead = readSync(fd, buffer, 0, buffer.length, position);
+      if (bytesRead <= 0) {
+        const firstLine = Buffer.concat(chunks, total).toString("utf8");
+        return { firstLine, truncated: false };
+      }
+
+      const data = buffer.subarray(0, bytesRead);
+      const newline = data.indexOf(0x0a);
+      if (newline >= 0) {
+        const piece = data.subarray(0, newline);
+        const bytes = total + piece.length;
+        if (bytes > HEADER_LINE_MAX_BYTES) {
+          return { firstLine: "", truncated: true, oversize: true };
+        }
+        if (piece.length > 0) chunks.push(Buffer.from(piece));
+        const firstLine = Buffer.concat(chunks, bytes).toString("utf8");
+        return {
+          firstLine: firstLine.endsWith("\r") ? firstLine.slice(0, -1) : firstLine,
+          truncated: false,
+        };
+      }
+
+      total += data.length;
+      position += data.length;
+      if (total > HEADER_LINE_MAX_BYTES) {
+        return { firstLine: "", truncated: true, oversize: true };
+      }
+      chunks.push(Buffer.from(data));
+    }
+
+    return { firstLine: "", truncated: true, oversize: true };
+  } finally {
+    closeSync(fd);
   }
-  return { head, firstLine: head, truncated: true, oversize: true };
 }
 
 /** Classify one `.jsonl` file. Never throws; failures become problems. */
@@ -330,7 +339,7 @@ export function classifySessionFile(filePath: string, stats?: { mtimeMs: number;
   const fromName = sessionIdFromFileName(filePath);
   const base = { path: filePath, mtimeMs: stat.mtimeMs, size: stat.size };
   try {
-    const { head, firstLine, truncated, oversize } = readHeaderLine(filePath);
+    const { firstLine, truncated, oversize } = readHeaderLine(filePath);
     if (oversize) {
       return {
         problem: {
@@ -386,7 +395,7 @@ export function classifySessionFile(filePath: string, stats?: { mtimeMs: number;
       id: record.id,
       cwd: typeof record.cwd === "string" ? record.cwd : undefined,
       name: display.name,
-      firstMessage: firstUserMessage(head),
+      firstMessage: display.firstMessage,
       idFromFileName: false,
     };
     if (fromName && fromName !== record.id) {
