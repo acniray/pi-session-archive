@@ -1,10 +1,44 @@
 # pi-session-archive
 
-Archive Pi sessions by moving their JSONL files out of Pi's active session tree.
-Archived files live under `<agentDir>/session-archive/`, so they disappear from
-Pi's active session catalogue. PI WEB can optionally expose native row/batch
-archive controls; those controls only appear when this extension is detected and
-delegate all mutations back to the extension.
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+Archive [Pi](https://github.com/earendil-works/pi) sessions by moving their
+JSONL files out of Pi's active session tree. Archived files live under
+`<agentDir>/session-archive/`, so they disappear from Pi's active session
+catalogue. PI WEB can optionally expose native row/batch archive controls;
+those controls only appear when this extension is detected and delegate all
+mutations back to the extension.
+
+This package was extracted from
+[pi-config](https://github.com/acniray/pi-config) with its full commit history
+preserved.
+
+## Features
+
+- **Multi-select archive** — pick any set of active root sessions and archive
+  each one together with the subagent sessions already present on disk.
+- **Subagent cascades** — descendants move before the root on archive, and the
+  root moves before descendants on restore, driven by the durable relation
+  graph found at lock time.
+- **Host integration** — a non-interactive `--ids` form for hosts such as
+  PI WEB, plus a selection-basket fallback for generic RPC hosts.
+- **Restore & export** — bring sessions back, or export one archived session
+  to standalone HTML.
+- **Diagnostics** — `/archive-check` reports split trees, duplicate files and
+  malformed archive state without freezing clean sessions.
+- **Safety by design** — the current session is never moved, mutations are
+  serialized by a cross-process lease, and partial failures attempt rollback
+  and report the exact recovery state.
+
+## Install
+
+```bash
+pi install git:github.com/acniray/pi-session-archive
+```
+
+Or add `"git:github.com/acniray/pi-session-archive"` to the `packages` array
+in your `settings.json`. The extension registers itself through the `pi`
+field of `package.json`.
 
 ## Commands
 
@@ -120,3 +154,7 @@ The regression suite covers durable-tree cascades, unrelated-corruption
 non-interference, target-local duplicate/multi-parent rejection, rollback,
 mutation locking, custom session directories, stable picker identity, EOF
 without newline, UTF-8 chunk boundaries, and archive index compatibility.
+
+## License
+
+[MIT](LICENSE)
